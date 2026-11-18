@@ -256,6 +256,8 @@ def test_start_request_runs_fetch_all_in_public_page(spider):
         "committeeId": "A9HCVU32F33A",
         "cutoff": "20230223",
         "delayMs": 1000,
+        "timeoutMs": 30000,
+        "maxFailures": 5,
     }
 
 
@@ -266,7 +268,24 @@ def test_list_keeps_three_years(caplog):
     with caplog.at_level(logging.WARNING):
         assert run_results(spider, {"list": LIST_RESULT, "meetings": {}}) == []
     assert spider._failed_requests == 185
-    assert "BoardDocs meeting DQ3VPX80F260 was not read" in caplog.text
+    assert "185 BoardDocs meetings were not read: DQ3VPX80F260, " in caplog.text
+
+
+def test_stopped_run_parses_what_was_read(caplog):
+    """After fetch_all_js stops, the meetings it read are still parsed and
+    the rest are counted as not read."""
+    spider = ColumBoeSpider()
+    results = {
+        "list": LIST_RESULT,
+        "meetings": {"DQ3VPX80F260": DQ3_RESULT},
+        "stopped": "5 failed calls in a row",
+    }
+    with caplog.at_level(logging.WARNING):
+        items = run_results(spider, results)
+    assert len(items) == 1
+    assert spider._failed_requests == 184
+    assert "Stopped reading BoardDocs after 5 failed calls in a row" in caplog.text
+    assert "184 BoardDocs meetings were not read" in caplog.text
 
 
 def test_cutoff_is_set_once_per_run():

@@ -35,6 +35,14 @@ class ColumBoeSpider(CityScrapersSpider):
     # Milliseconds between BoardDocs calls. DOWNLOAD_DELAY does not apply,
     # because the calls are made from inside the browser page, not by Scrapy.
     fetch_delay_ms = 1000
+    # Nothing else limits a call: page.evaluate() and the browser's fetch()
+    # have no deadline, so one stalled response would hang the whole run
+    fetch_timeout_ms = 30000
+    # Stop calling BoardDocs once this many calls in a row have failed
+    # (blocked or down), so a bad run ends instead of failing every remaining
+    # call. Checked before each meeting, so the stop comes after a whole
+    # agenda and meeting pair.
+    max_consecutive_failures = 5
 
     # BoardDocs sits behind CloudFront, which now blocks plain HTTP clients
     # (Scrapy, Postman) even with a browser User-Agent: it answers 200 with a
@@ -62,14 +70,23 @@ class ColumBoeSpider(CityScrapersSpider):
     # call at a time. Every call's status and raw text are returned for the
     # Python side to check and parse (scrapy-playwright's own response body
     # is the rendered page, which wraps JSON in HTML). The random number in
-    # each URL is the page's own cache-buster.
-    fetch_all_js = """async ({baseUrl, committeeId, cutoff, delayMs}) => {
+    # each URL is the page's own cache-buster. Each call is aborted after
+    # timeoutMs, including reading its body, and returned as a failed result.
+    # After maxFailures failed calls in a row the loop stops and says so in
+    # "stopped".
+    fetch_all_js = """async ({
+        baseUrl, committeeId, cutoff, delayMs, timeoutMs, maxFailures,
+    }) => {
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        let failuresInRow = 0;
         const post = async (endpoint, body) => {
             const cacheBuster = String(Math.floor(1e14 + Math.random() * 9e14));
             const url = baseUrl
                 .replace("{endpoint}", endpoint)
                 .replace("{cache_buster}", cacheBuster);
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            let result;
             try {
                 const r = await fetch(url, {
                     method: "POST",
@@ -78,11 +95,17 @@ class ColumBoeSpider(CityScrapersSpider):
                         "Content-Type": "application/x-www-form-urlencoded",
                         "X-Requested-With": "XMLHttpRequest",
                     },
+                    signal: controller.signal,
                 });
-                return {url, status: r.status, text: await r.text()};
+                result = {url, status: r.status, text: await r.text()};
             } catch (e) {
-                return {url, status: 0, text: "", error: String(e)};
+                result = {url, status: 0, text: "", error: String(e)};
+            } finally {
+                clearTimeout(timer);
             }
+            const failed = result.status !== 200 || !result.text.trim();
+            failuresInRow = failed ? failuresInRow + 1 : 0;
+            return result;
         };
         const list = await post(
             "BD-GetMeetingsList", "current_committee_id=" + committeeId
@@ -102,6 +125,10 @@ class ColumBoeSpider(CityScrapersSpider):
             if (!item || !item.unique || !/^\\d{8}$/.test(item.numberdate)
                     || item.numberdate < cutoff) {
                 continue;
+            }
+            if (failuresInRow >= maxFailures) {
+                const stopped = `${failuresInRow} failed calls in a row`;
+                return {list, meetings, stopped};
             }
             const body = `current_committee_id=${committeeId}&id=${item.unique}`;
             await sleep(delayMs);
@@ -196,6 +223,8 @@ class ColumBoeSpider(CityScrapersSpider):
                             "committeeId": self.boarddocs_committee_id,
                             "cutoff": cutoff.strftime("%Y%m%d"),
                             "delayMs": self.fetch_delay_ms,
+                            "timeoutMs": self.fetch_timeout_ms,
+                            "maxFailures": self.max_consecutive_failures,
                         },
                     ),
                 },
@@ -273,12 +302,16 @@ class ColumBoeSpider(CityScrapersSpider):
             # Reported at close as "0 meetings parsed"
             self.logger.warning("BoardDocs meetings list is not JSON: %s", e)
             return
+        if results.get("stopped"):
+            self.logger.warning(
+                "Stopped reading BoardDocs after %s", results["stopped"]
+            )
+        not_read = []
         for item in self._get_clean_meetings(meetings):
             meeting_id = item["unique"]
             fetched = results["meetings"].get(meeting_id)
             if not fetched:
-                self._failed_requests += 1
-                self.logger.warning("BoardDocs meeting %s was not read", meeting_id)
+                not_read.append(meeting_id)
                 continue
             # A failed agenda call is counted, but the meeting is still
             # parsed, without an agenda link, so it is not lost
@@ -288,6 +321,14 @@ class ColumBoeSpider(CityScrapersSpider):
             if meeting is None:
                 continue
             yield from self.parse(meeting, meeting_id=meeting_id, agenda_id=agenda_id)
+        if not_read:
+            # One line for all of them: after a stop this can be most meetings
+            self._failed_requests += len(not_read)
+            self.logger.warning(
+                "%d BoardDocs meetings were not read: %s",
+                len(not_read),
+                ", ".join(not_read),
+            )
 
     def _parse_agenda_id(self, agenda, meeting_id):
         """The agenda link points to the meeting's first agenda item, as in the
